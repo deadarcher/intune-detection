@@ -1,0 +1,8 @@
+services:
+  intune-detection:
+    build: .
+    image: intune-detection
+    container_name: intune-detection
+    ports:
+      - "8080:80"
+    restart: unless-stopped

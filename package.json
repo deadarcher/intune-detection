@@ -1,0 +1,25 @@
+{
+  "name": "intune-detection",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Get the Intune Win32 detection rule for an MSI, EXE or install script, with a version operator that survives the next update. 100% client-side - nothing is uploaded.",
+  "license": "MIT",
+  "homepage": "https://getrff.com/intune-detection/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/deadarcher/intune-detection.git"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro",
+    "check:parity": "node scripts/check-lib-parity.mjs"
+  },
+  "dependencies": {
+    "astro": "^5.16.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,413 @@
+---
+/**
+ * The Intune detection rule generator, in the browser. The open-source build of
+ * https://getrff.com/intune-detection/
+ *
+ * The engine is src/lib/intuneDetection.ts on top of the installer parser (readInstaller.ts,
+ * installerDetect.ts, msi.ts), all byte-identical to the hosted copy. The file is parsed in your
+ * browser and never uploaded.
+ */
+import Layout from '../layouts/Layout.astro';
+import '../styles/tools.css';
+
+const title = 'Intune Detection Rule Generator - Free, Nothing Uploaded';
+const description =
+  'Drop an MSI or EXE and get the Intune Win32 detection rule for it, with the version operator ' +
+  'set so a new build still applies. Most broken deployments trace back to a rule that was fine on ' +
+  'day one and quietly stopped matching after the first update.';
+
+const faq = [
+  ['Why does my app show as not installed after an update?',
+   'Almost always the version operator. "Equals" is what everybody picks first, and it works right up until the first update. The app installs, detection matches, then a new version ships and the rule matches nothing, so Intune calls it not-installed forever and keeps pushing the old build over the new one. Everything here uses "Greater than or equal to", which survives updates and still comes back not-detected when the app really is missing or older.'],
+  ['Is a file-exists rule good enough?',
+   'It’s the most common rule and it’s the one that burns people. All it tells you is that something got written to disk at some point. Not that this version is there, and not that the install finished. It reports detected on a machine with a half-finished install, and it keeps reporting detected after a failed upgrade. Use the MSI product code if there’s one, otherwise a registry or file rule with a version check on it.'],
+  ['Why is the registry rule two rules?',
+   'Uninstall keys live in two registry views. A 32-bit installer on 64-bit Windows lands under WOW6432Node and a 64-bit one doesn’t, and you can’t always tell which from the file alone. When it isn’t certain you get both paths, so you can check one machine and use whichever it turns out to be.'],
+  ['Is anything uploaded?',
+   'No. It’s parsed in your browser. Nothing leaves the machine, and you can watch the network tab to confirm that.'],
+  ['What about a script rule?',
+   'You get one when none of the field-based rules can be filled in completely. Scripts can do more, but they’re much easier to get wrong. The classic mistake is exiting 0 on both branches, which means it can never come back not-detected and Intune thinks the app is installed everywhere. The one generated here writes to STDOUT and sets a zero exit code on one branch only.'],
+];
+
+const siteUrl = (Astro.site ?? new URL('https://getrff.com')).toString();
+const jsonLd = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'WebApplication',
+    name: 'Intune Detection Rule Generator',
+    applicationCategory: 'DeveloperApplication',
+    operatingSystem: 'Any (browser)',
+    description,
+    url: new URL('/intune-detection/', siteUrl).toString(),
+    offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: faq.map(([q, a]) => ({
+      '@type': 'Question', name: q,
+      acceptedAnswer: { '@type': 'Answer', text: a },
+    })),
+  },
+];
+---
+
+<Layout title={title} description={description} jsonLd={jsonLd}>
+  <header class="tool-nav">
+    <a href="/" class="tool-nav-home">Intune detection rule</a>
+    <a href="https://getrff.com/tools/" class="tool-nav-by">More free tools &rarr;</a>
+  </header>
+
+  <main class="tools-wrap">
+    <div class="tool-hero">
+      <h1>Intune detection rule generator</h1>
+      <p class="sub">
+        Drop an installer and get the detection rule for it, with the version operator set so a new
+        build still applies. Get this wrong and Intune either never sees the app, or won’t let you
+        <strong>update</strong> it.
+      </p>
+      <span class="privacy-badge">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        Parsed in your browser. Nothing is uploaded.
+      </span>
+    </div>
+
+    <label class="drop" id="drop" for="file" tabindex="0">
+      <input id="file" type="file" hidden accept=".msi,.exe,.msp,.msix,.appx,.ps1,.cmd,.bat,.vbs" />
+      <p id="drop-msg">Drop an MSI, EXE or install script here, or click to choose</p>
+    </label>
+    <p class="status" id="status"></p>
+
+    <section id="result" hidden>
+      <div class="pkg" id="pkg"></div>
+      <div class="det-notice" id="rules-notice" hidden>
+        <strong>Not much to go on in this one.</strong>
+        <span id="rules-notice-body"></span>
+      </div>
+      <p class="det-lead" id="rules-lead"></p>
+      <div class="reinstall-row">
+        <label class="reinstall-check">
+          <input type="checkbox" id="reinstall" />
+          <span>I need to push this again at the <strong>same version</strong> (repair, re-enrol, changed payload)</span>
+        </label>
+        <div class="reinstall-token" id="reinstall-token-row" hidden>
+          <label for="deployment-id">Deployment token</label>
+          <input id="deployment-id" type="text" placeholder="2026-09-11-r1" spellcheck="false" />
+          <span class="org-hint">Bump this to make every machine install again.</span>
+        </div>
+      </div>
+
+      <div class="org-row" id="org-row" hidden>
+        <label for="org">Your company or team name</label>
+        <input id="org" type="text" placeholder="Contoso" autocomplete="organization" spellcheck="false" />
+        <span class="org-hint">Fills in the key path and the script below.</span>
+      </div>
+      <div id="rules"></div>
+      <div class="det-warns" id="warns" hidden>
+        <div class="det-warns-h">Whichever rule you use</div>
+        <ul id="warn-list"></ul>
+      </div>
+    </section>
+
+    <div class="tool-prose">
+      <h2>What usually goes wrong</h2>
+      <p>
+        You can test an install command in about a minute. Run it, and it either goes in silently or
+        it doesn’t. Detection doesn’t have this moment. A bad rule works fine on your test box and
+        then falls over months later across the fleet, and what you actually see (an app reinstalling
+        itself over and over, or one that says it’s installed when it isn’t) doesn’t look anything
+        like a detection problem.
+      </p>
+      <p>
+        The version operator is where it usually happens. Set it to &ldquo;Equals&rdquo; and the rule
+        only matches one build. Ship an update, Intune decides the app is gone, and it pushes the old
+        version back over the new one. Everything generated here uses &ldquo;Greater than or equal
+        to&rdquo; instead.
+      </p>
+
+      <h2>Questions</h2>
+      {faq.map(([q, a]) => (
+        <details class="faq"><summary>{q}</summary><p>{a}</p></details>
+      ))}
+    </div>
+    <p class="byline">
+      Built by the <a href="https://getrff.com">RFF</a> team. Hosted at
+      <a href="https://getrff.com/intune-detection/">getrff.com/intune-detection</a>.
+      Sister tools: <a href="https://getrff.com/switchhunt/">SwitchHunt</a> (silent install switches)
+      &middot; <a href="https://getrff.com/create-intunewin/">Create a .intunewin</a> (package it for Intune)
+      &middot; <a href="https://getrff.com/vbs-to-powershell/">VBS to PowerShell</a> (convert old scripts).
+    </p>
+  </main>
+</Layout>
+
+<script>
+  import { readForDetection } from '../lib/readInstaller';
+  import { buildDetectionAdvice } from '../lib/intuneDetection';
+  import type { DetectionAdvice } from '../lib/intuneDetection';
+
+  const $ = (id: string) => document.getElementById(id)!;
+  const esc = (v: string) =>
+    v.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+
+  function setStatus(msg: string, bad = false) {
+    const el = $('status');
+    el.textContent = msg;
+    el.className = 'status' + (bad ? ' status-bad' : '');
+  }
+
+  const CHIP: Record<string, string> = { exact: 'From the package', likely: 'Very likely', template: 'Template' };
+
+  function card(rule: any, best: boolean): string {
+    const fields = rule.fields.map((f: any) =>
+      `<tr><td class="det-lbl">${esc(f.label)}</td><td><code>${esc(f.value)}</code>` +
+      (f.note ? `<div class="det-note">${esc(f.note)}</div>` : '') + '</td></tr>').join('');
+    return '<div class="det-card' + (best ? ' det-best' : '') + '">' +
+      '<div class="det-head">' +
+        (rule.rank ? '<span class="det-rank' + (best ? ' det-rank-best' : '') + '">' + rule.rank + '</span>' : '') +
+        '<span class="det-chip det-' + rule.confidence + '">' +
+        (CHIP[rule.confidence] ?? rule.confidence) + '</span><strong>' + esc(rule.title) + '</strong></div>' +
+      (rule.pick ? '<p class="det-pick">' + esc(rule.pick) + '</p>' : '') +
+      (rule.rationale ? '<p class="det-why">' + esc(rule.rationale) + '</p>' : '') +
+      '<table class="det-table">' + fields + '</table>' +
+      (rule.todo?.length
+        ? '<ul class="det-todo">' + rule.todo.map((t: string) => '<li>' + esc(t) + '</li>').join('') + '</ul>'
+        : '') +
+      (rule.script ? '<pre class="det-script"><code>' + esc(rule.script) + '</code></pre>' : '') +
+      '</div>';
+  }
+
+  function render(advice: DetectionAdvice, fileName: string, engine: string) {
+    $('result').hidden = false;
+    // The org box only means anything for a tag rule, and it lives OUTSIDE #rules so a re-render
+    // never rebuilds the input the user is typing into.
+    const k = advice.rules[0]?.kind;
+    ($('org-row') as HTMLElement).hidden = !(k === 'tag' || k === 'reinstall');
+    ($('rules-notice') as HTMLElement).hidden = !advice.notice;
+    $('rules-notice-body').textContent = advice.notice ?? '';
+    $('pkg').innerHTML = '<strong>' + esc(fileName) + '</strong>' +
+      (engine ? ' <span class="pkg-engine">' + esc(engine) + '</span>' : '');
+    $('rules-lead').textContent = advice.lead ?? '';
+    $('rules').innerHTML = advice.rules.map((r, i) => card(r, i === 0)).join('');
+    const warns = $('warns');
+    if (advice.warnings.length) {
+      warns.hidden = false;
+      $('warn-list').innerHTML = advice.warnings.map(w => '<li>' + esc(w) + '</li>').join('');
+    } else {
+      warns.hidden = true;
+    }
+  }
+
+  // Held so typing a company name can rebuild the advice without re-reading the file.
+  let last: { result: any; fileName: string } | null = null;
+  let org = '';
+  let reinstall = false;
+  let deploymentId = '';
+
+  function rebuild() {
+    if (!last) return;
+    const advice = buildDetectionAdvice(last.result, { org, reinstall, deploymentId });
+    render(advice, last.fileName, advice.rules[0]?.kind === 'tag' ? 'script' : (last.result.engine ?? ''));
+  }
+
+  async function handleFile(file: File) {
+    setStatus('Reading ' + file.name + '…');
+    try {
+      const { result } = await readForDetection(file, setStatus);
+      let advice: DetectionAdvice | null = null;
+      try { advice = buildDetectionAdvice(result); } catch { advice = null; }
+      if (!advice || !advice.rules.length) {
+        $('result').hidden = true;
+        setStatus('Could not work out a detection rule from that file. It parsed, but nothing in it identifies the installed product.', true);
+        return;
+      }
+      setStatus('');
+      last = { result, fileName: file.name };
+      rebuild();
+    } catch {
+      $('result').hidden = true;
+      setStatus('Could not read that file. Try another.', true);
+    }
+  }
+
+  $('reinstall').addEventListener('change', e => {
+    reinstall = (e.target as HTMLInputElement).checked;
+    ($('reinstall-token-row') as HTMLElement).hidden = !reinstall;
+    rebuild();
+  });
+  ($('deployment-id') as HTMLInputElement).addEventListener('input', e => {
+    deploymentId = (e.target as HTMLInputElement).value;
+    rebuild();
+  });
+
+  ($('org') as HTMLInputElement).addEventListener('input', e => {
+    org = (e.target as HTMLInputElement).value;
+    rebuild();
+  });
+
+  const drop = $('drop'), fileInput = $('file') as HTMLInputElement;
+  fileInput.addEventListener('change', () => { const f = fileInput.files?.[0]; if (f) handleFile(f); });
+
+  // The highlight class is 'drag' because that is what tools.css styles (.drop.drag -> brand border
+  // + brand background). This page used to add 'is-over', which nothing styles, so dragging a file
+  // over the zone gave no feedback at all.
+  //
+  // Depth COUNTER rather than a plain add/remove pair: dragleave also fires when the pointer crosses
+  // onto the <p> inside the zone, so a bare toggle drops the highlight while the file is still over
+  // the target.
+  let dragDepth = 0;
+  const setDrag = (on: boolean) => drop.classList.toggle('drag', on);
+
+  drop.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; setDrag(true); });
+  drop.addEventListener('dragover', e => {
+    e.preventDefault();
+    const dt = (e as DragEvent).dataTransfer;
+    if (dt) dt.dropEffect = 'copy';   // shows a copy cursor instead of the browser's default 'move'
+    setDrag(true);
+  });
+  drop.addEventListener('dragleave', e => {
+    e.preventDefault();
+    if (--dragDepth <= 0) { dragDepth = 0; setDrag(false); }
+  });
+  drop.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dragDepth = 0; setDrag(false);
+    const f = (e as DragEvent).dataTransfer?.files?.[0];
+    if (f) handleFile(f);
+  });
+</script>
+
+<style>
+  /* The only result-area nodes that live in the TEMPLATE, so scoping works here. */
+  .status { font-size: 13px; color: var(--ink-2); min-height: 20px; margin: 10px 0 0; }
+  .status-bad { color: var(--danger); }
+  .tool-nav-home { font-weight: 700; color: var(--ink); text-decoration: none; }
+</style>
+
+{/*
+  Everything under #result is assembled with innerHTML in the page script. Those nodes never carry
+  Astro's data-astro-cid attribute, so the scoped selectors that used to hold these rules could not
+  match them and the entire generated rule set rendered as unstyled text. Same bug vulnscan hit and
+  fixed the same way: global, with every selector confined to #result so nothing escapes this page.
+
+  The token names were independently wrong too (--ink2 / --ink3 / --hairline do not exist; the real
+  ones are --ink-2 / --ink-3 / --border), so even the few selectors that DID match resolved their
+  colours to nothing.
+
+  Deliberately restrained: this is a form the admin retypes into the Intune portal, so it should read
+  like the portal's own field list, not like marketing. Structure and legibility, nothing decorative.
+*/}
+<style is:global>
+  #result { margin-top: 22px; }
+
+  /* Package header: filename reads as the artifact it is, engine as a quiet tag beside it. */
+  #result .pkg { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; margin: 0 0 16px; }
+  #result .pkg strong {
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 13px; font-weight: 600;
+    word-break: break-all;
+  }
+  #result .pkg-engine {
+    flex-shrink: 0; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--ink-3); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px;
+  }
+
+  #result .det-card {
+    border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+    padding: 16px 18px; margin: 0 0 14px;
+  }
+  /* The first rule is the one to use. An inset brand rule marks it without adding copy. */
+  #result .det-best { border-color: var(--brand-border); box-shadow: inset 3px 0 0 var(--brand); }
+
+  #result .det-lead { font-size: 13px; line-height: 1.6; color: var(--ink-2); margin: 0 0 14px; text-wrap: pretty; }
+
+  /* Shown only when every rule is a template, i.e. the file told us almost nothing. */
+  #result .det-notice {
+    font-size: 13px; line-height: 1.6; text-wrap: pretty; color: var(--ink);
+    background: var(--warning-bg); border: 1px solid color-mix(in srgb, var(--warning) 38%, transparent);
+    border-radius: 10px; padding: 12px 14px; margin: 0 0 14px;
+  }
+  #result .det-notice strong { color: var(--warning); margin-right: 4px; }
+
+  /* Only shown for the tag rule, where the one value we cannot know is the org name. */
+  .reinstall-row { margin: 0 0 14px; }
+  .reinstall-check { display: flex; align-items: flex-start; gap: 9px; font-size: 13px; line-height: 1.5; color: var(--ink); cursor: pointer; }
+  .reinstall-check input { margin-top: 2px; flex-shrink: 0; width: 15px; height: 15px; accent-color: var(--brand); }
+  .reinstall-token { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 0 24px; }
+  .reinstall-token[hidden] { display: none; }
+  .reinstall-token label { font-size: 13px; font-weight: 600; color: var(--ink); }
+  .reinstall-token input {
+    width: 170px; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border-strong);
+    background: var(--surface); color: var(--ink); font-size: 13px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  .reinstall-token input:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; border-color: var(--brand); }
+
+  #result .org-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 14px; }
+  /* An author `display` beats the UA rule for [hidden], so hiding it needs saying explicitly.
+     Without this the box renders for every package while its .hidden property reads true. */
+  #result .org-row[hidden] { display: none; }
+  #result .org-row label { font-size: 13px; font-weight: 600; color: var(--ink); }
+  #result .org-row input {
+    width: 190px; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border-strong);
+    background: var(--surface); color: var(--ink); font-size: 13px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  #result .org-row input:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; border-color: var(--brand); }
+  #result .org-hint { font-size: 12px; color: var(--ink-3); }
+
+  #result .det-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  /* Three cards side by side give no clue which one to reach for. The number says it outright. */
+  #result .det-rank {
+    flex-shrink: 0; width: 21px; height: 21px; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; line-height: 1;
+    background: color-mix(in srgb, var(--ink) 9%, transparent); color: var(--ink-2);
+  }
+  #result .det-rank-best { background: var(--brand); color: #fff; }
+  #result .det-pick { font-size: 13px; font-weight: 600; color: var(--ink); margin: 0 0 8px; }
+  #result .det-head strong { font-size: 15px; font-weight: 600; }
+  #result .det-chip {
+    flex-shrink: 0; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    padding: 3px 7px; border-radius: 4px; white-space: nowrap;
+  }
+  #result .det-exact    { background: #dcfce7; color: #166534; }
+  #result .det-likely   { background: #fef9c3; color: #854d0e; }
+  #result .det-template { background: #e2e8f0; color: #334155; }
+
+  #result .det-why { font-size: 13px; line-height: 1.6; color: var(--ink-2); margin: 0 0 13px; text-wrap: pretty; }
+
+  /* Field list. Ruled rows are what make a long value and its note read as ONE field - without them
+     the label, the value and the note all ran together as a single paragraph. */
+  #result .det-table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 0; }
+  #result .det-table td { padding: 9px 0; vertical-align: top; border-top: 1px solid var(--border); }
+  #result .det-table tr:first-child td { border-top: none; padding-top: 0; }
+  #result .det-lbl { width: 38%; padding-right: 18px; color: var(--ink-2); }
+  #result .det-table code {
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12.5px; color: var(--ink);
+    background: color-mix(in srgb, var(--ink) 6%, transparent);
+    padding: 2px 6px; border-radius: 4px; word-break: break-all;
+  }
+  #result .det-note { font-size: 12px; line-height: 1.5; color: var(--ink-3); margin-top: 6px; text-wrap: pretty; }
+
+  /* The fields the generator could NOT fill in. The rule is not finished until these are done, and
+     in grey they read as optional footnotes. Red + 500 matches .blocker-list in tools.css. */
+  #result .det-todo { font-size: 12.5px; line-height: 1.6; color: var(--danger); font-weight: 500; margin: 13px 0 0; padding-left: 18px; }
+  #result .det-todo li { margin: 4px 0; text-wrap: pretty; }
+
+  #result .det-script {
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; line-height: 1.6;
+    background: #0f172a; color: #e2e8f0; padding: 12px 14px; border-radius: 8px;
+    overflow-x: auto; margin: 13px 0 0;
+  }
+  #result .det-script code { font-family: inherit; background: none; padding: 0; color: inherit; }
+
+  #result .det-warns {
+    border: 1px solid var(--border); border-radius: 10px; background: var(--surface-alt);
+    padding: 14px 16px; margin-top: 4px;
+  }
+  #result .det-warns-h {
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--ink-3); margin-bottom: 8px;
+  }
+  #result .det-warns ul { font-size: 12.5px; line-height: 1.6; color: var(--ink-2); margin: 0; padding-left: 18px; }
+  #result .det-warns li { margin: 5px 0; text-wrap: pretty; }
+</style>
